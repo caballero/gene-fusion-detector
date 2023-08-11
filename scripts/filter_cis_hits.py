@@ -1,5 +1,7 @@
 #!/usr/bin/python
 
+# Script to compare 2 PAF mappings to identify possible gene fusions in long-read data
+
 import re
 import sys
 import csv
@@ -41,7 +43,7 @@ gtf_fields = [
     "attributes"
 ]
 
-gtf_trans_match = re.compile('transcript_id "(.+?)"')
+gtf_match = re.compile('gene_id "(.+?)"; transcript_id "(.+?)"')
 
 def load_annotations(gtf_file):
     ann = {}
@@ -53,15 +55,17 @@ def load_annotations(gtf_file):
                               fieldnames = gtf_fields)
         for row in reader:
             if row["feature"] == "transcript":
-                res = re.search(gtf_trans_match, row['attributes'])
+                res = re.search(gtf_match, row['attributes'])
                 if res:
                     counter += 1
-                    trans_id = res.group(1)
+                    gene_id = res.group(1)
+                    trans_id = res.group(2)
                     ann[trans_id] = {}
-                    ann[trans_id]["chrom"]  = row['chrom']
-                    ann[trans_id]["start"]  = row['start']
-                    ann[trans_id]["end"]    = row['end']
-                    ann[trans_id]["strand"] = row['strand']
+                    ann[trans_id]['gene_id'] = gene_id
+                    ann[trans_id]["chrom"]   = row['chrom']
+                    ann[trans_id]["start"]   = int(row['start'])
+                    ann[trans_id]["end"]     = int(row['end'])
+                    ann[trans_id]["strand"]  = row['strand']
                     
                 else:
                     logging.error(f"cannot find transcipt_id in {row}")
@@ -74,7 +78,124 @@ def load_annotations(gtf_file):
         sys.exit(1)     
 
 
+def load_matches(input_file, annot):
+    logging.debug(f"loading mapping from {input_file}")
+    matches = {}
+    counter = 0
+    with open(input_file, "r") as fh:
+        reader=csv.DictReader(fh,
+                              delimiter="\t", 
+                              fieldnames=paf_fields)
+        for row in reader:
+            read  = row['q_name']
+            name  = row['t_name'].split("|")
+            trans = name[0]
+            if trans in annot:
+                matches[read] = {}
+                matches[read]['trans']   = trans
+                matches[read]['chrom']   = annot[trans]['chrom']
+                matches[read]['start']   = annot[trans]['start']
+                matches[read]['end']     = annot[trans]['end']
+                matches[read]['strand']  = annot[trans]['strand']
+                matches[read]['gene_id'] = annot[trans]['gene_id']
+                counter += 1
+            else:
+                logging.error(f"No annotation for {trans}")
+    logging.debug (f"loaded {counter} annotation for reads")
+    if counter > 0:
+        return matches
+    else:
+        logging.error(f"No annotations found from {input_file}")
+        sys.exit(1)
+
+
+def get_distance(s1, e1, s2, e2):
+    if s1 < s2 and e1 <= s2:   # gen1 -> gen2
+        return s2 - e1
+    elif s2 < s1 and e2 <= s1: # gen2 -> gen1
+        return s1 - e2 
+    else:                      # overlapped regions
+        return -1
+
+
+def filter_matches(out_file, input_file, matches, annot, maxlen):
+    logging.debug(f"comparing mapping from {input_file}, outfile is {out_file}")
+    counter = 0
+    out_header = ["#read_id",
+                  "g1",
+                  "t1",
+                  "t1_chrom",
+                  "t1_start",
+                  "t1_end",
+                  "t1_strand",
+                  "dist",
+                  "g2",
+                  "t2",
+                  "t2_chrom",
+                  "t2_start",
+                  "t2_end",
+                  "t2_strand"]
+    with open(out_file, "w") as out:
+        writer = csv.writer(out,
+                            delimiter="\t",
+                            quoting=csv.QUOTE_NONE)
+        writer.writerow(out_header)
+        with open(input_file, "r") as fh:
+            reader=csv.DictReader(fh,
+                                delimiter="\t", 
+                                fieldnames=paf_fields)
+            for row in reader:
+                read  = row['q_name']
+                name  = row['t_name'].split("|")
+                m2_trans = name[0]
+                if m2_trans in annot:
+                    if read in matches:
+                        m1_trans  = matches[read]['trans'] 
+                        m1_chr    = matches[read]['chrom']
+                        m1_start  = matches[read]['start']
+                        m1_end    = matches[read]['end']
+                        m1_strand = matches[read]['strand']
+                        m1_gene   = matches[read]['gene_id']
+                        m2_chr    = annot[m2_trans]['chrom']
+                        m2_start  = annot[m2_trans]['start']
+                        m2_end    = annot[m2_trans]['end']
+                        m2_strand = annot[m2_trans]['strand']
+                        m2_gene   = annot[m2_trans]['gene_id']
+                        if not m1_chr == m2_chr:
+                            continue
+
+                        dist = get_distance(m1_start,
+                                            m1_end,
+                                            m2_start,
+                                            m2_end)
+                        if dist <= maxlen:
+                            counter += 1
+                            writer.writerow([read,
+                                             m1_gene,
+                                             m1_trans,
+                                             m1_chr,
+                                             str(m1_start),
+                                             str(m1_end),
+                                             m1_strand,
+                                             str(dist),
+                                             m2_gene,
+                                             m2_trans,
+                                             m2_chr,
+                                             str(m2_start),
+                                             str(m2_end),
+                                             m2_strand])        
+                    else:
+                        logging.error(f"read {read} is not a previous match")
+                else:
+                    logging.error(f"No annotation for {m2_trans}")
+
+    if counter > 0:
+        logging.debug (f"found {counter} reads as putative fusions")
+    else:
+        logging.error(f"No annotations found from {input_file}")
+        sys.exit(1)
                 
+
 def main():
     # Minimal sequence size after match removal
     max_len = 5000000 
@@ -110,8 +231,20 @@ def main():
     if args.verbose:
         logging.basicConfig(level=logging.DEBUG)
 
-    annot = load_annotations(args.gtf)
+    annotation    = load_annotations(args.gtf)
+    
+    first_matches = load_matches(args.input1, annotation)
+    
+    filter_matches(args.output,
+                   args.input2,
+                   first_matches,
+                   annotation,
+                   args.maxlen)
+    
+    logging.debug("Completed")
 
 
 if __name__ == "__main__":
     main()
+
+
